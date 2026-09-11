@@ -8,6 +8,23 @@ Domain shifted from options to **intraday stock trading** partway through
 design — cleaner fit for a demo (faster-moving data, clearer guardrails,
 more visible agentic reasoning).
 
+## Scope revision (post-brief): risk management dropped, signal/model quality is now the core
+
+After this brief was written, scope was narrowed further: the risk
+assessment calculation, strategy agent, and reconciliation/escalation
+logic (all documented below) are **cut from the active build**. The
+project now centers entirely on the **signal generation subsystem** — the
+model-designer/orchestrator loop that writes, trains, and iterates a
+traditional ML model under walk-forward optimization.
+
+Everything below this point (risk calc, strategy agent, escalation tiers)
+is kept for historical context on how the design evolved, but is **not
+being built** unless scope is revisited. The "why this design is
+defensible" section's points about WFO rigor and overfitting-awareness
+still apply directly to the current scope; the points about bounding
+agent autonomy via escalation no longer apply since there's no
+trading-relevant action being gated.
+
 ---
 
 ## Design principle: not every step deserves to be an LLM agent
