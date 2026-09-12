@@ -9,4 +9,5 @@ venv/
 
 data/
 iterations/
+generated_models/
 *.log

@@ -1,0 +1,104 @@
+import argparse
+import re
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+GENERATED_MODELS_DIR = Path("generated_models")
+REFERENCE_MODEL_PATH = Path(__file__).resolve().parents[1] / "wfo" / "example_model.py"
+DEFAULT_MODEL = "sonnet"
+CLAUDE_TIMEOUT_SECONDS = 300
+
+CONTRACT_TEMPLATE = """You are an ML engineering agent for an intraday equity signal-prediction system. You do not predict the market yourself — you write the Python code for a traditional ML model (feature engineering, model choice, hyperparameters) that a deterministic harness will train and walk-forward test. A trained model does the actual predicting; your job is the code.
+
+Write a single self-contained Python script that:
+
+1. Accepts these CLI arguments: --data-dir --ticker --train-months --predict-months --gap-days --output-dir
+2. Loads OHLCV minute-bar data for the given ticker from a CSV at <data-dir>/<ticker>.csv with columns: timestamp (epoch ms), open, high, low, close, volume, vwap, transactions
+3. Uses `wfo.windows.walk_forward_windows(start, end, train_months, predict_months, gap_days)` to generate walk-forward windows — this is already importable on the Python path. Do not reimplement window generation yourself.
+4. For EACH window, independently:
+   - Slice the raw dataframe to strictly [train_start, train_end) and [predict_start, predict_end) using the datetime column
+   - Compute ALL features and labels freshly on each slice AFTER slicing, never on the full unsliced series. This is a hard safety rule: a rolling/lookback feature will produce NaN at the start of a slice (drop those rows); a forward-looking label (e.g. future return) will produce NaN at the end of a slice (drop those rows too, don't try to preserve them). This is what prevents information from the gap period or the other window from leaking in.
+   - Train a model (any scikit-learn-compatible estimator) on the train slice
+   - Predict/backtest on the predict slice
+   - Compute f1, accuracy, roi, max_drawdown for that window. If your task is regression rather than classification, still report all four by deriving a directional trading signal from the prediction for the backtest and accuracy/f1 metrics.
+   - CRITICAL backtest correctness rule: if your label/target looks forward by N minutes (e.g. "future_return" is a shift(-N) return), that return is repeated across N consecutive overlapping rows. Compounding every row's overlapping return in the equity curve counts the same price move roughly N times and will produce wildly inflated (or wildly negative) ROI that has nothing to do with real performance. The backtest must only take non-overlapping decision points, spaced by the label horizon (e.g. `predict_df.iloc[::horizon_minutes]` before compounding). f1/accuracy can still be scored on every row — this overlap rule applies specifically to the compounded ROI/equity/max_drawdown calculation.
+   - Save the fitted model's weights to `<output-dir>/window_<index>_weights.pkl` (pickle)
+   - Save a backtest ledger (per-row: datetime, close, future_return or equivalent, predicted, strategy_return, equity) to `<output-dir>/window_<index>_ledger.csv`
+   - Skip windows with too little data (fewer than 100 train rows or 20 predict rows) rather than erroring
+5. Uses `wfo.schema.WindowResult`, `wfo.schema.IterationResults`, and `wfo.schema.write_results` (already importable) to assemble and write `<output-dir>/results.json` — do not redefine this schema yourself.
+6. Sets `prediction_target` in IterationResults to a short string describing exactly what you're predicting (e.g. "price_up_in_10min", "return_above_15bps_in_5min"). You choose the prediction framing based on the instructions you're given — be willing to try something genuinely different from prior iterations when told to.
+6b. Sets `approach` in IterationResults to a single sentence naming your model type and feature set (e.g. "RandomForestClassifier on MACD/RSI/SMA-crossover features"). This is shown directly to a human reviewing iterations, so keep it short and concrete rather than generic.
+7. Must run standalone via `python script.py <args>` with `wfo` importable from PYTHONPATH.
+8. Must not make any network calls, must not use subprocess/os.system/eval/exec, and must not read or write any path outside --data-dir (read-only) and --output-dir (write). A separate safety reviewer checks for this before the script is ever run — any violation gets it rejected outright.
+
+Here is a working reference implementation of this exact contract (a deliberately simple baseline, provided so you can see the required structure). Follow its structure faithfully — reuse of wfo.windows and wfo.schema, per-slice feature/label computation, output file layout — but come up with your OWN feature engineering, model choice, and prediction framing per the instructions you are given. Do not just copy this one.
+
+```python
+{reference_source}
+```
+
+Respond with ONLY the complete Python script, in a single fenced python code block. No explanation before or after.
+"""
+
+
+def _build_system_prompt() -> str:
+    reference_source = REFERENCE_MODEL_PATH.read_text()
+    return CONTRACT_TEMPLATE.format(reference_source=reference_source)
+
+
+def _extract_code(text: str) -> str:
+    match = re.search(r"```(?:python)?\n(.*?)```", text, re.DOTALL)
+    return match.group(1) if match else text
+
+
+def generate_model_script(instructions: str, iteration_tag: str | None = None, model: str = DEFAULT_MODEL) -> Path:
+    tag = iteration_tag or datetime.now().strftime("%Y%m%dT%H%M%S")
+
+    result = subprocess.run(
+        [
+            "claude",
+            "-p",
+            instructions,
+            "--system-prompt",
+            _build_system_prompt(),
+            "--model",
+            model,
+            "--output-format",
+            "text",
+            "--restricted",
+            "--disallowedTools",
+            "Bash",
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "--permission-prompts",
+            "none",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=CLAUDE_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"claude CLI failed (exit {result.returncode}): {result.stderr}")
+
+    code = _extract_code(result.stdout)
+
+    GENERATED_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    path = GENERATED_MODELS_DIR / f"{tag}_model.py"
+    path.write_text(code)
+    return path
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("instructions")
+    parser.add_argument("--tag", default=None)
+    args = parser.parse_args()
+
+    path = generate_model_script(args.instructions, args.tag)
+    print(path)
+
+
+if __name__ == "__main__":
+    main()
