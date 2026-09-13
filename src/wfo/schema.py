@@ -13,7 +13,10 @@ class WindowResult:
     f1: float
     accuracy: float
     roi: float
+    net_roi: float
     max_drawdown: float
+    buy_hold_roi: float
+    num_trades: int
     weights_path: str
     ledger_path: str
 

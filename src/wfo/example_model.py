@@ -1,5 +1,6 @@
 import argparse
 import pickle
+from datetime import timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -7,6 +8,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
 
 from wfo.schema import IterationResults, WindowResult, write_results
+from wfo.timeutils import time_based_future_return, time_based_trade_points
 from wfo.windows import walk_forward_windows
 
 PREDICTION_HORIZON_MINUTES = 5
@@ -14,6 +16,9 @@ ROLLING_WINDOW_MINUTES = 20
 FEATURE_COLS = ["rolling_mean_return", "rolling_vol", "volume_z"]
 MIN_TRAIN_ROWS = 100
 MIN_PREDICT_ROWS = 20
+STARTING_CAPITAL_USD = 10_000
+COMMISSION_PER_TRADE_USD = 1.0
+LONG_ONLY = False
 
 
 def load_ticker_data(data_dir: Path, ticker: str) -> pd.DataFrame:
@@ -33,23 +38,37 @@ def prepare_window_slice(df: pd.DataFrame, start, end) -> pd.DataFrame:
         slice_df["volume"] - slice_df["volume"].rolling(ROLLING_WINDOW_MINUTES).mean()
     ) / slice_df["volume"].rolling(ROLLING_WINDOW_MINUTES).std()
 
-    future_close = slice_df["close"].shift(-PREDICTION_HORIZON_MINUTES)
-    slice_df["label"] = (future_close > slice_df["close"]).astype("Int64")
-    slice_df["future_return"] = future_close / slice_df["close"] - 1
+    slice_df["future_return"] = time_based_future_return(slice_df, PREDICTION_HORIZON_MINUTES)
+    slice_df["label"] = (slice_df["future_return"] > 0).astype("Int64")
 
     return slice_df.dropna(subset=[*FEATURE_COLS, "label", "future_return"])
 
 
-def backtest(predict_df: pd.DataFrame, predictions, horizon_minutes: int) -> tuple[float, float, pd.DataFrame]:
+def buy_hold_roi(df: pd.DataFrame, start, end) -> float:
+    mask = (df["datetime"].dt.date >= start) & (df["datetime"].dt.date < end)
+    raw = df.loc[mask]
+    if len(raw) < 2:
+        return 0.0
+    return float(raw["close"].iloc[-1] / raw["close"].iloc[0] - 1)
+
+
+def backtest(
+    predict_df: pd.DataFrame, predictions, horizon_minutes: int, long_only: bool = LONG_ONLY
+) -> tuple[float, float, float, int, pd.DataFrame]:
     predict_df = predict_df.reset_index(drop=True)
     predictions = pd.Series(predictions).reset_index(drop=True)
 
     # future_return looks `horizon_minutes` ahead, so consecutive rows overlap.
     # Compounding every row would count the same price move many times over.
-    # Only take non-overlapping decision points, spaced by the horizon.
-    trade_idx = list(range(0, len(predict_df), horizon_minutes))
+    # Only take non-overlapping decision points, spaced by real elapsed time
+    # (not row count, since gaps in the data would otherwise let a "trade"
+    # silently span hours or days instead of the intended horizon).
+    trade_idx = time_based_trade_points(predict_df, horizon_minutes)
     trades = predict_df.iloc[trade_idx].reset_index(drop=True)
     trade_predictions = predictions.iloc[trade_idx].reset_index(drop=True)
+    if long_only:
+        trade_predictions = trade_predictions.clip(lower=0)
+    num_trades = int((trade_predictions != 0).sum())
 
     strategy_returns = trade_predictions * trades["future_return"]
     equity = (1 + strategy_returns).cumprod()
@@ -58,11 +77,25 @@ def backtest(predict_df: pd.DataFrame, predictions, horizon_minutes: int) -> tup
     drawdown = (equity - running_max) / running_max
     max_drawdown = float(drawdown.min()) if len(drawdown) else 0.0
 
+    # Net of a flat $1 brokerage fee per trade, against an assumed
+    # STARTING_CAPITAL_USD account. A flat dollar fee is only meaningful as a
+    # percentage relative to an assumed capital base, unlike the rest of this
+    # backtest which works in pure returns from a notional 1.0 starting point.
+    # Only charged when a trade is actually taken (nonzero position) — a flat
+    # decision point isn't a transaction.
+    capital = STARTING_CAPITAL_USD
+    net_equity = []
+    for r, pred in zip(strategy_returns, trade_predictions):
+        capital = capital * (1 + r) - (COMMISSION_PER_TRADE_USD if pred != 0 else 0.0)
+        net_equity.append(capital)
+    net_roi = float(capital / STARTING_CAPITAL_USD - 1) if len(strategy_returns) else 0.0
+
     ledger = trades[["datetime", "close", "future_return"]].copy()
     ledger["predicted"] = trade_predictions
     ledger["strategy_return"] = strategy_returns
     ledger["equity"] = equity
-    return roi, max_drawdown, ledger
+    ledger["net_equity_usd"] = net_equity
+    return roi, net_roi, max_drawdown, num_trades, ledger
 
 
 def main():
@@ -73,10 +106,16 @@ def main():
     parser.add_argument("--predict-months", type=int, required=True)
     parser.add_argument("--gap-days", type=int, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--holdout-months", type=int, default=0,
+        help="Reserve this many trailing months of data from all WFO windows, so a later "
+             "run with --holdout-months 0 extends into a genuinely unseen blind-test period.",
+    )
     args = parser.parse_args()
 
     df = load_ticker_data(args.data_dir, args.ticker)
-    start, end = df["datetime"].min().date(), df["datetime"].max().date()
+    start, full_end = df["datetime"].min().date(), df["datetime"].max().date()
+    end = full_end - timedelta(days=30 * args.holdout_months)
     windows = walk_forward_windows(start, end, args.train_months, args.predict_months, args.gap_days)
 
     window_results = []
@@ -92,7 +131,8 @@ def main():
 
         f1 = float(f1_score(predict["label"], predictions, zero_division=0))
         accuracy = float(accuracy_score(predict["label"], predictions))
-        roi, max_drawdown, ledger = backtest(predict, predictions, PREDICTION_HORIZON_MINUTES)
+        roi, net_roi, max_drawdown, num_trades, ledger = backtest(predict, predictions, PREDICTION_HORIZON_MINUTES)
+        bh_roi = buy_hold_roi(df, w.predict_start, w.predict_end)
 
         weights_path = args.output_dir / f"window_{w.index}_weights.pkl"
         ledger_path = args.output_dir / f"window_{w.index}_ledger.csv"
@@ -109,7 +149,10 @@ def main():
                 f1=f1,
                 accuracy=accuracy,
                 roi=roi,
+                net_roi=net_roi,
                 max_drawdown=max_drawdown,
+                buy_hold_roi=bh_roi,
+                num_trades=num_trades,
                 weights_path=str(weights_path),
                 ledger_path=str(ledger_path),
             )

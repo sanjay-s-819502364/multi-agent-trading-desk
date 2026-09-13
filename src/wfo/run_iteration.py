@@ -25,11 +25,15 @@ def run_iteration(
     predict_months: int,
     gap_days: int,
     iteration_id: str | None = None,
+    contract_version: str | None = None,
+    holdout_months: int = 0,
 ) -> tuple[bool, str]:
     iteration_id = iteration_id or make_iteration_id(ticker)
     output_dir = ITERATIONS_DIR / iteration_id
     output_dir.mkdir(parents=True)
     shutil.copy(script_path, output_dir / "script.py")
+    if contract_version is not None:
+        (output_dir / "contract_version.txt").write_text(contract_version)
 
     cmd = [
         sys.executable,
@@ -46,6 +50,8 @@ def run_iteration(
         str(gap_days),
         "--output-dir",
         str(output_dir),
+        "--holdout-months",
+        str(holdout_months),
     ]
 
     env = {**os.environ, "PYTHONPATH": str(SRC_DIR)}
@@ -91,10 +97,12 @@ def main():
     parser.add_argument("--train-months", type=int, required=True)
     parser.add_argument("--predict-months", type=int, required=True)
     parser.add_argument("--gap-days", type=int, default=1)
+    parser.add_argument("--holdout-months", type=int, default=0)
     args = parser.parse_args()
 
     ok, message = run_iteration(
-        args.script_path, args.ticker, args.train_months, args.predict_months, args.gap_days
+        args.script_path, args.ticker, args.train_months, args.predict_months, args.gap_days,
+        holdout_months=args.holdout_months,
     )
     print(message)
     sys.exit(0 if ok else 1)
