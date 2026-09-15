@@ -29,6 +29,42 @@ def time_based_future_return(df: pd.DataFrame, horizon_minutes: int, tolerance_m
     return pd.Series(future_close / df["close"].to_numpy() - 1, index=df.index)
 
 
+def attach_sentiment_features(
+    bars: pd.DataFrame, news: pd.DataFrame, lookback_hours: float = 24.0
+) -> pd.DataFrame:
+    """Attach trailing news-sentiment features to each bar, leakage-safe.
+
+    For each bar, `sentiment_mean`/`sentiment_count` summarize only articles
+    published at or before that bar's own timestamp (never after) — computed
+    by rolling the sentiment series over `lookback_hours` evaluated at each
+    article's own publish time, then merge_asof'd backward onto the bars. A
+    bar with no qualifying prior article gets a neutral 0.0/0 rather than NaN,
+    since "no news yet" is itself a legitimate, known state at decision time.
+    """
+    bars = bars.reset_index(drop=True)
+    if news.empty:
+        bars["sentiment_mean"] = 0.0
+        bars["sentiment_count"] = 0
+        return bars
+
+    news = news.sort_values("published_utc").reset_index(drop=True)
+    rolled = (
+        news.set_index("published_utc")["sentiment_score"]
+        .rolling(pd.Timedelta(hours=lookback_hours))
+        .agg(["mean", "count"])
+        .reset_index()
+        .rename(columns={"mean": "sentiment_mean", "count": "sentiment_count"})
+    )
+    rolled["published_utc"] = rolled["published_utc"].astype(bars["datetime"].dtype)
+
+    merged = pd.merge_asof(
+        bars, rolled, left_on="datetime", right_on="published_utc", direction="backward",
+    )
+    merged["sentiment_mean"] = merged["sentiment_mean"].fillna(0.0)
+    merged["sentiment_count"] = merged["sentiment_count"].fillna(0).astype(int)
+    return merged.drop(columns=["published_utc"])
+
+
 def time_based_trade_points(df: pd.DataFrame, horizon_minutes: int) -> list[int]:
     """Positional indices for non-overlapping backtest decision points, spaced
     by at least `horizon_minutes` of real elapsed time, not row count.

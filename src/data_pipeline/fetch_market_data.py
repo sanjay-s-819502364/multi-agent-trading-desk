@@ -10,7 +10,7 @@ from massive.exceptions import BadResponse
 
 load_dotenv()
 
-TICKERS = ["AAPL", "MSFT", "SPY", "NVDA", "AMZN"]
+TICKERS = ["AAPL", "MSFT", "SPY", "NVDA", "AMZN", "GOOGL", "META", "JPM"]
 YEARS_BACK = 2
 OUTPUT_DIR = Path("data/minute_aggs")
 SECONDS_BETWEEN_CALLS = 13

@@ -3,20 +3,42 @@ import pickle
 from datetime import timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score
 
 from wfo.schema import IterationResults, WindowResult, write_results
-from wfo.timeutils import attach_sentiment_features, time_based_future_return, time_based_trade_points
 from wfo.windows import walk_forward_windows
 
-PREDICTION_HORIZON_MINUTES = 5
-ROLLING_WINDOW_MINUTES = 20
-SENTIMENT_LOOKBACK_HOURS = 24
-FEATURE_COLS = ["rolling_mean_return", "rolling_vol", "volume_z", "sentiment_mean", "sentiment_count"]
-MIN_TRAIN_ROWS = 100
-MIN_PREDICT_ROWS = 20
+# ---------------------------------------------------------------------------
+# This is a SWING-TRADING reference model: it operates on DAILY bars (one row
+# per trading day), not minute bars. That matters for how horizons work:
+#
+# On minute bars, a fixed row-offset (.shift(-N), .iloc[::N]) is dangerous —
+# missing bars and session/day boundaries mean N rows can silently cover far
+# more real time than N minutes (see wfo.timeutils and the intraday contract).
+#
+# On DAILY bars this problem doesn't exist: each row already IS exactly one
+# trading day, with no sub-day gaps. So a plain `.shift(-N)` for "N trading
+# days ahead" and `.iloc[::N]` for "one decision point every N trading days"
+# are CORRECT and safe here — there is no equivalent gap-contamination risk.
+# Do not import wfo.timeutils for swing models; it solves a problem that
+# doesn't apply to daily bars and would misinterpret "N days" as calendar
+# time rather than trading days.
+# ---------------------------------------------------------------------------
+
+HOLDING_DAYS = 10          # swing horizon: ~2 trading weeks
+LABEL_RETURN_THRESHOLD = 0.03  # 3% move over the holding period
+SMA_FAST, SMA_SLOW = 10, 20
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+VOL_WINDOW = 20
+
+FEATURE_COLS = ["sma_cross", "rsi", "roc_10", "atr_pct", "volume_z", "trend_up"]
+
+MIN_TRAIN_ROWS = 150
+MIN_PREDICT_ROWS = 8
 STARTING_CAPITAL_USD = 10_000
 COMMISSION_PER_TRADE_USD = 1.0
 LONG_ONLY = False
@@ -28,31 +50,46 @@ def load_ticker_data(data_dir: Path, ticker: str) -> pd.DataFrame:
     return df.sort_values("datetime").reset_index(drop=True)
 
 
-def load_news_data(news_dir: Path, ticker: str) -> pd.DataFrame:
-    path = news_dir / f"{ticker}.csv"
-    if not path.exists():
-        return pd.DataFrame(columns=["published_utc", "sentiment_score"])
-    df = pd.read_csv(path)
-    df["published_utc"] = pd.to_datetime(df["published_utc"], utc=True)
-    return df
+def _rsi(close: pd.Series, period: int) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean().replace(0, np.nan)
+    return 100 - (100 / (1 + gain / loss))
 
 
-def prepare_window_slice(df: pd.DataFrame, news: pd.DataFrame, start, end) -> pd.DataFrame:
+def prepare_window_slice(df: pd.DataFrame, start, end) -> pd.DataFrame:
     mask = (df["datetime"].dt.date >= start) & (df["datetime"].dt.date < end)
-    slice_df = df.loc[mask].reset_index(drop=True).copy()
+    d = df.loc[mask].reset_index(drop=True).copy()
+    if len(d) == 0:
+        return d
 
-    slice_df["return_1m"] = slice_df["close"].pct_change()
-    slice_df["rolling_mean_return"] = slice_df["return_1m"].rolling(ROLLING_WINDOW_MINUTES).mean()
-    slice_df["rolling_vol"] = slice_df["return_1m"].rolling(ROLLING_WINDOW_MINUTES).std()
-    slice_df["volume_z"] = (
-        slice_df["volume"] - slice_df["volume"].rolling(ROLLING_WINDOW_MINUTES).mean()
-    ) / slice_df["volume"].rolling(ROLLING_WINDOW_MINUTES).std()
-    slice_df = attach_sentiment_features(slice_df, news, SENTIMENT_LOOKBACK_HOURS)
+    close = d["close"]
+    sma_fast = close.rolling(SMA_FAST).mean()
+    sma_slow = close.rolling(SMA_SLOW).mean()
+    d["sma_cross"] = (sma_fast - sma_slow) / sma_slow
 
-    slice_df["future_return"] = time_based_future_return(slice_df, PREDICTION_HORIZON_MINUTES)
-    slice_df["label"] = (slice_df["future_return"] > 0).astype("Int64")
+    d["rsi"] = _rsi(close, RSI_PERIOD)
+    d["roc_10"] = close.pct_change(10)
 
-    return slice_df.dropna(subset=[*FEATURE_COLS, "label", "future_return"])
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [d["high"] - d["low"], (d["high"] - prev_close).abs(), (d["low"] - prev_close).abs()], axis=1
+    ).max(axis=1)
+    d["atr_pct"] = tr.rolling(ATR_PERIOD).mean() / close
+
+    vol_mean = d["volume"].rolling(VOL_WINDOW).mean()
+    vol_std = d["volume"].rolling(VOL_WINDOW).std()
+    d["volume_z"] = (d["volume"] - vol_mean) / vol_std.replace(0, np.nan)
+
+    trend_sma = close.rolling(SMA_SLOW).mean()
+    d["trend_up"] = (close > trend_sma).astype(float)
+
+    # Safe on daily bars: each row is exactly one trading day.
+    future_close = close.shift(-HOLDING_DAYS)
+    d["future_return"] = future_close / close - 1
+    d["label"] = (d["future_return"] > LABEL_RETURN_THRESHOLD).astype("Int64")
+
+    return d.dropna(subset=[*FEATURE_COLS, "label", "future_return"]).reset_index(drop=True)
 
 
 def buy_hold_roi(df: pd.DataFrame, start, end) -> float:
@@ -64,17 +101,14 @@ def buy_hold_roi(df: pd.DataFrame, start, end) -> float:
 
 
 def backtest(
-    predict_df: pd.DataFrame, predictions, horizon_minutes: int, long_only: bool = LONG_ONLY
+    predict_df: pd.DataFrame, predictions, holding_days: int, long_only: bool = LONG_ONLY
 ) -> tuple[float, float, float, int, pd.DataFrame]:
     predict_df = predict_df.reset_index(drop=True)
     predictions = pd.Series(predictions).reset_index(drop=True)
 
-    # future_return looks `horizon_minutes` ahead, so consecutive rows overlap.
-    # Compounding every row would count the same price move many times over.
-    # Only take non-overlapping decision points, spaced by real elapsed time
-    # (not row count, since gaps in the data would otherwise let a "trade"
-    # silently span hours or days instead of the intended horizon).
-    trade_idx = time_based_trade_points(predict_df, horizon_minutes)
+    # Non-overlapping decision points, one every `holding_days` ROWS — safe
+    # here since rows are daily bars with no sub-day gaps (see module note).
+    trade_idx = list(range(0, len(predict_df), holding_days))
     trades = predict_df.iloc[trade_idx].reset_index(drop=True)
     trade_predictions = predictions.iloc[trade_idx].reset_index(drop=True)
     if long_only:
@@ -88,12 +122,6 @@ def backtest(
     drawdown = (equity - running_max) / running_max
     max_drawdown = float(drawdown.min()) if len(drawdown) else 0.0
 
-    # Net of a flat $1 brokerage fee per trade, against an assumed
-    # STARTING_CAPITAL_USD account. A flat dollar fee is only meaningful as a
-    # percentage relative to an assumed capital base, unlike the rest of this
-    # backtest which works in pure returns from a notional 1.0 starting point.
-    # Only charged when a trade is actually taken (nonzero position) — a flat
-    # decision point isn't a transaction.
     capital = STARTING_CAPITAL_USD
     net_equity = []
     for r, pred in zip(strategy_returns, trade_predictions):
@@ -112,39 +140,38 @@ def backtest(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, required=True)
-    parser.add_argument("--news-dir", type=Path, default=Path("data/news"))
     parser.add_argument("--ticker", required=True)
     parser.add_argument("--train-months", type=int, required=True)
     parser.add_argument("--predict-months", type=int, required=True)
     parser.add_argument("--gap-days", type=int, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument(
-        "--holdout-months", type=int, default=0,
-        help="Reserve this many trailing months of data from all WFO windows, so a later "
-             "run with --holdout-months 0 extends into a genuinely unseen blind-test period.",
-    )
+    parser.add_argument("--holdout-months", type=int, default=0)
     args = parser.parse_args()
 
     df = load_ticker_data(args.data_dir, args.ticker)
-    news = load_news_data(args.news_dir, args.ticker)
     start, full_end = df["datetime"].min().date(), df["datetime"].max().date()
     end = full_end - timedelta(days=30 * args.holdout_months)
     windows = walk_forward_windows(start, end, args.train_months, args.predict_months, args.gap_days)
 
     window_results = []
     for w in windows:
-        train = prepare_window_slice(df, news, w.train_start, w.train_end)
-        predict = prepare_window_slice(df, news, w.predict_start, w.predict_end)
+        train = prepare_window_slice(df, w.train_start, w.train_end)
+        predict = prepare_window_slice(df, w.predict_start, w.predict_end)
         if len(train) < MIN_TRAIN_ROWS or len(predict) < MIN_PREDICT_ROWS:
             continue
+        if train["label"].nunique() < 2:
+            continue
 
-        model = LogisticRegression(max_iter=1000)
+        model = RandomForestClassifier(
+            n_estimators=200, max_depth=4, min_samples_leaf=15,
+            class_weight="balanced", random_state=42, n_jobs=-1,
+        )
         model.fit(train[FEATURE_COLS], train["label"])
         predictions = model.predict(predict[FEATURE_COLS])
 
         f1 = float(f1_score(predict["label"], predictions, zero_division=0))
         accuracy = float(accuracy_score(predict["label"], predictions))
-        roi, net_roi, max_drawdown, num_trades, ledger = backtest(predict, predictions, PREDICTION_HORIZON_MINUTES)
+        roi, net_roi, max_drawdown, num_trades, ledger = backtest(predict, predictions, HOLDING_DAYS)
         bh_roi = buy_hold_roi(df, w.predict_start, w.predict_end)
 
         weights_path = args.output_dir / f"window_{w.index}_weights.pkl"
@@ -173,11 +200,11 @@ def main():
 
     results = IterationResults(
         ticker=args.ticker,
-        prediction_target=f"price_up_in_{PREDICTION_HORIZON_MINUTES}min",
+        prediction_target=f"return_above_{int(LABEL_RETURN_THRESHOLD*100)}pct_in_{HOLDING_DAYS}days",
         approach=(
-            f"LogisticRegression on rolling_mean_return/rolling_vol/volume_z "
-            f"({ROLLING_WINDOW_MINUTES}min window) plus trailing news-sentiment "
-            f"mean/count ({SENTIMENT_LOOKBACK_HOURS}h lookback)"
+            f"RandomForestClassifier on SMA-crossover/RSI/ROC/ATR%/volume-zscore/trend-filter "
+            f"daily features, {HOLDING_DAYS}-day swing horizon with a "
+            f"{int(LABEL_RETURN_THRESHOLD*100)}% move threshold."
         ),
         train_months=args.train_months,
         predict_months=args.predict_months,

@@ -12,15 +12,21 @@ REPORT_PATH = Path("reports/index.html")
 RUN_TIMESTAMP_RE = re.compile(r"^(\d{8}T\d{6})")
 
 
-def parse_run_timestamp(run_name: str) -> str | None:
-    match = RUN_TIMESTAMP_RE.match(run_name)
-    if not match:
-        return None
+def parse_run_timestamp(dir_path: Path) -> str | None:
+    match = RUN_TIMESTAMP_RE.match(dir_path.name)
+    if match:
+        try:
+            dt = datetime.strptime(match.group(1), "%Y%m%dT%H%M%S")
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+    # Fall back to the directory's mtime for iterations without a timestamp
+    # prefix (e.g. ad-hoc cross-ticker backtests), so every row still shows a
+    # real date rather than a blank.
     try:
-        dt = datetime.strptime(match.group(1), "%Y%m%dT%H%M%S")
-    except ValueError:
+        return datetime.fromtimestamp(dir_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    except OSError:
         return None
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def load_iteration(dir_path: Path) -> dict | None:
@@ -44,7 +50,7 @@ def load_iteration(dir_path: Path) -> dict | None:
 
     return {
         "run": dir_path.name,
-        "generated_at": parse_run_timestamp(dir_path.name),
+        "generated_at": parse_run_timestamp(dir_path),
         "contract_version": contract_version,
         "ticker": payload.get("ticker", "?"),
         "approach": payload.get("approach", "(pre-dates approach field)"),

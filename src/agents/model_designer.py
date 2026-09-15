@@ -6,20 +6,27 @@ from pathlib import Path
 
 GENERATED_MODELS_DIR = Path("generated_models")
 REFERENCE_MODEL_PATH = Path(__file__).resolve().parents[1] / "wfo" / "example_model.py"
+REFERENCE_SWING_MODEL_PATH = Path(__file__).resolve().parents[1] / "wfo" / "example_swing_model.py"
+REFERENCE_DAYTRADE_MODEL_PATH = Path(__file__).resolve().parents[1] / "wfo" / "example_daytrade_model.py"
+REFERENCE_OVERNIGHT_MODEL_PATH = Path(__file__).resolve().parents[1] / "wfo" / "example_overnight_model.py"
 DEFAULT_MODEL = "sonnet"
 CLAUDE_TIMEOUT_SECONDS = 600
 
-# Bump this whenever CONTRACT_TEMPLATE changes in a way that materially
+# Bump this whenever a CONTRACT_TEMPLATE changes in a way that materially
 # affects generated scripts (new required field, new correctness rule, etc.),
 # so reports can show which contract version produced which iteration.
-CONTRACT_VERSION = "v6-holdout"
+CONTRACT_VERSION = "v7-sentiment"
+CONTRACT_VERSION_SWING = "v1-swing"
+CONTRACT_VERSION_DAYTRADE = "v1-daytrade"
+CONTRACT_VERSION_OVERNIGHT = "v1-overnight"
 
 CONTRACT_TEMPLATE = """You are an ML engineering agent for an intraday equity signal-prediction system. You do not predict the market yourself — you write the Python code for a traditional ML model (feature engineering, model choice, hyperparameters) that a deterministic harness will train and walk-forward test. A trained model does the actual predicting; your job is the code.
 
 Write a single self-contained Python script that:
 
-1. Accepts these CLI arguments: --data-dir --ticker --train-months --predict-months --gap-days --output-dir --holdout-months (default 0, int)
+1. Accepts these CLI arguments: --data-dir --ticker --train-months --predict-months --gap-days --output-dir --holdout-months (default 0, int) --news-dir (default "data/news")
 2. Loads OHLCV minute-bar data for the given ticker from a CSV at <data-dir>/<ticker>.csv with columns: timestamp (epoch ms), open, high, low, close, volume, vwap, transactions
+2b. OPTIONAL news-sentiment features: a CSV may exist at <news-dir>/<ticker>.csv with columns: published_utc (ISO datetime string), sentiment_score (float, -1.0=negative, 0.0=neutral, +1.0=positive), title. Load it with `pd.read_csv` and `pd.to_datetime(df["published_utc"], utc=True)` if you want to use it — handle the file not existing (empty DataFrame) gracefully, since not every ticker will have news coverage. If you use sentiment, you MUST derive it via `wfo.timeutils.attach_sentiment_features(slice_df, news_df, lookback_hours)` (already importable) rather than joining it yourself — it merge_asof's backward so each row only ever sees news published at or before that row's own timestamp, which is the leakage-safe way to join an irregularly-timed external series onto bar data. Do not attempt a same-day full join or any join that could put same-bar-or-later news onto a row. Using sentiment is optional — if the instructions don't call for it or you judge the coverage too sparse to help, plain price/volume features are fine.
 3. Computes `end = full_data_max_date - 30*holdout_months days` (via `datetime.timedelta`) and uses `wfo.windows.walk_forward_windows(start, end, train_months, predict_months, gap_days)` to generate walk-forward windows — this is already importable on the Python path. Do not reimplement window generation yourself. `--holdout-months` exists so a trailing slice of history can be reserved from every window during iterative search, then revealed later (by rerunning the same script with `--holdout-months 0`) as a genuine blind test — this only works if you compute `end` from `--holdout-months` exactly as described; do not ignore this argument.
 4. For EACH window, independently:
    - Slice the raw dataframe to strictly [train_start, train_end) and [predict_start, predict_end) using the datetime column
@@ -53,7 +60,139 @@ Respond with ONLY the complete Python script, in a single fenced python code blo
 """
 
 
-def _build_system_prompt() -> str:
+CONTRACT_TEMPLATE_SWING = """You are an ML engineering agent for a SWING-TRADING equity signal-prediction system. You do not predict the market yourself — you write the Python code for a traditional ML model (feature engineering, model choice, hyperparameters) that a deterministic harness will train and walk-forward test. A trained model does the actual predicting; your job is the code. Positions are held for days to a couple of weeks, not minutes — this is a fundamentally lower-frequency style than intraday trading.
+
+Write a single self-contained Python script that:
+
+1. Accepts these CLI arguments: --data-dir --ticker --train-months --predict-months --gap-days --output-dir --holdout-months (default 0, int)
+2. Loads OHLCV DAILY-bar data for the given ticker from a CSV at <data-dir>/<ticker>.csv with columns: timestamp (epoch ms, midnight of the trading day), open, high, low, close, volume, vwap, transactions — exactly ONE ROW PER TRADING DAY, already deduplicated (no intraday gaps to worry about).
+3. Computes `end = full_data_max_date - 30*holdout_months days` (via `datetime.timedelta`) and uses `wfo.windows.walk_forward_windows(start, end, train_months, predict_months, gap_days)` to generate walk-forward windows — this is already importable on the Python path. Do not reimplement window generation yourself. `--holdout-months` exists so a trailing slice of history can be reserved from every window during iterative search, then revealed later (by rerunning the same script with `--holdout-months 0`) as a genuine blind test — this only works if you compute `end` from `--holdout-months` exactly as described; do not ignore this argument.
+4. For EACH window, independently:
+   - Slice the raw dataframe to strictly [train_start, train_end) and [predict_start, predict_end) using the datetime column
+   - Compute ALL features and labels freshly on each slice AFTER slicing, never on the full unsliced series. A rolling/lookback feature will produce NaN at the start of a slice (drop those rows); a forward-looking label will produce NaN at the end of a slice (drop those rows too). This prevents information from the gap period or the other window from leaking in.
+   - IMPORTANT — this is DAILY data, not minute data: on daily bars, a plain `.shift(-N)` for "N trading days ahead" and `.iloc[::N]` for "one decision point every N trading days" are CORRECT and safe, because each row already IS exactly one trading day with no sub-day gaps. Do NOT import `wfo.timeutils` (`time_based_future_return`/`time_based_trade_points`) — that module solves a minute-bar-specific gap problem that does not apply here, and using it would misinterpret "N days" as calendar time (getting confused by weekends) rather than N trading days.
+   - Keep rolling-window feature lookbacks short enough to fit comfortably inside your `--predict-months` window (e.g. if predict_months=2 gives ~40 trading days, a 100-day lookback would wipe out the entire predict slice via dropna — keep lookbacks to a fraction of the predict window's expected row count, e.g. 10-30 days for a 2-3 month predict window).
+   - Train a model (any scikit-learn-compatible estimator) on the train slice
+   - Predict/backtest on the predict slice
+   - Compute f1, accuracy, roi, max_drawdown for that window. If your task is regression rather than classification, still report all four by deriving a directional trading signal from the prediction for the backtest and accuracy/f1 metrics.
+   - Also compute `net_roi`: the same backtest, but with a flat $1 brokerage commission deducted at every ACTUAL trade (a nonzero position; a flat/no-trade decision point is not a transaction and is not charged), against an assumed $10,000 starting capital (`STARTING_CAPITAL_USD = 10_000`, `COMMISSION_PER_TRADE_USD = 1.0`). This must be a separate compounding pass over the SAME trade points as the gross `roi` calculation: iterate the per-trade returns in order, updating `capital = capital * (1 + trade_return) - (COMMISSION_PER_TRADE_USD if position != 0 else 0)`, then `net_roi = capital / STARTING_CAPITAL_USD - 1`. Swing trading is naturally low-frequency (a handful of trades per month), so fee drag matters much less than in intraday trading — but still compute it properly, never skip it.
+   - Also compute `num_trades`: the count of decision points where an actual (nonzero) position was taken.
+   - Support an optional `long_only` behavior: accept a module-level constant `LONG_ONLY = False` (default) that, when the instructions ask for a long-only strategy, should be set to `True` and applied by clipping the position to `max(position, 0)` before computing strategy_returns, net_roi, and num_trades. Only apply this if explicitly instructed.
+   - COST-AWARE DESIGN: a round trip costs $2 (two $1 commissions) against the $10,000 capital assumption. Since swing trades are held for days to weeks and typically target moves of a few percent (much larger than intraday basis-point targets), $2 is a much smaller relative concern than in intraday trading — but the target move should still comfortably exceed a few basis points of slippage/cost, not be a coin-flip-sized wiggle.
+   - Also compute `buy_hold_roi` for that window: the plain buy-and-hold return over the SAME predict period, using the raw (unfiltered) close prices — `raw_close.iloc[-1] / raw_close.iloc[0] - 1` on the predict-period slice BEFORE any feature/label dropna trimming.
+   - Save the fitted model's weights to `<output-dir>/window_<index>_weights.pkl` (pickle)
+   - Save a backtest ledger (per-row: datetime, close, future_return or equivalent, predicted, strategy_return, equity) to `<output-dir>/window_<index>_ledger.csv`
+   - Skip windows with too little data rather than erroring — with daily bars and limited history, train/predict slices are much smaller than intraday (tens to a couple hundred rows, not thousands); use a lower minimum row threshold than you would for minute-bar data (e.g. ~100+ train rows, ~8-15+ predict rows), since being too strict here can silently skip most or all windows.
+5. Uses `wfo.schema.WindowResult`, `wfo.schema.IterationResults`, and `wfo.schema.write_results` (already importable) to assemble and write `<output-dir>/results.json` — do not redefine this schema yourself.
+6. Sets `prediction_target` in IterationResults to a short string describing exactly what you're predicting (e.g. "return_above_3pct_in_10days"). You choose the prediction framing and holding period (typically 3-15 trading days) based on the instructions you're given.
+6b. Sets `approach` in IterationResults to a single sentence naming your model type, feature set, and holding period. This is shown directly to a human reviewing iterations, so keep it short and concrete.
+7. Must run standalone via `python script.py <args>` with `wfo` importable from PYTHONPATH.
+8. Must not make any network calls, must not use subprocess/os.system/eval/exec, and must not read or write any path outside --data-dir (read-only) and --output-dir (write). A separate safety reviewer checks for this before the script is ever run — any violation gets it rejected outright.
+
+Here is a working reference implementation of this exact contract (a deliberately simple baseline, provided so you can see the required structure). Follow its structure faithfully — reuse of wfo.windows and wfo.schema, per-slice feature/label computation, row-based (not time-based) horizon handling, output file layout — but come up with your OWN feature engineering, model choice, holding period, and prediction framing per the instructions you are given. Do not just copy this one.
+
+```python
+{reference_source}
+```
+
+Respond with ONLY the complete Python script, in a single fenced python code block. No explanation before or after.
+"""
+
+
+CONTRACT_TEMPLATE_DAYTRADE = """You are an ML engineering agent for a DAY-TRADE (open-to-close) equity signal-prediction system. You do not predict the market yourself — you write the Python code for a traditional ML model (feature engineering, model choice, hyperparameters) that a deterministic harness will train and walk-forward test. A trained model does the actual predicting; your job is the code.
+
+The strategy decides ONCE PER DAY, at that day's OPEN, whether to enter a position — and the position is ALWAYS closed at that SAME day's CLOSE. No overnight holding, no fixed N-day horizon. This introduces a leakage risk distinct from swing or intraday-minute models: today's own high/low/close/volume are NOT known at the moment you'd decide to enter at today's open — they only exist once the day is over.
+
+Write a single self-contained Python script that:
+
+1. Accepts these CLI arguments: --data-dir --ticker --train-months --predict-months --gap-days --output-dir --holdout-months (default 0, int)
+2. Loads OHLCV DAILY-bar data for the given ticker from a CSV at <data-dir>/<ticker>.csv with columns: timestamp (epoch ms, midnight of the trading day), open, high, low, close, volume, vwap, transactions — one row per trading day.
+3. Computes `end = full_data_max_date - 30*holdout_months days` (via `datetime.timedelta`) and uses `wfo.windows.walk_forward_windows(start, end, train_months, predict_months, gap_days)` to generate walk-forward windows — already importable, do not reimplement. `--holdout-months` exists so a trailing slice of history can be reserved during search, then revealed later via `--holdout-months 0` as a genuine blind test.
+4. For EACH window, independently:
+   - Slice the raw dataframe to strictly [train_start, train_end) and [predict_start, predict_end) using the datetime column
+   - CRITICAL leakage rule, specific to this open-to-close style: compute every FEATURE using only data through YESTERDAY's close, then `.shift(1)` it so row T sees T-1's indicator value — never T's own high/low/close/volume/vwap as a feature (those don't exist yet when you'd decide to enter at T's open). The only exceptions that are legitimately knowable AT today's open: today's own `open` price itself (e.g. `gap = open / prior_close - 1`), and anything derived purely from T-1 and earlier (e.g. `prior_range = (high.shift(1) - low.shift(1)) / close.shift(1)`).
+   - The LABEL is `close / open - 1` computed on the SAME row (today's own open-to-close return) — this is fine as a training TARGET, it is never used as a feature.
+   - Compute ALL features and the label freshly on each slice AFTER slicing, never on the full unsliced series — same per-slice discipline as every other style, so nothing crosses the train/predict boundary.
+   - Train a model (any scikit-learn-compatible estimator) on the train slice
+   - Predict/backtest on the predict slice
+   - Compute f1, accuracy, roi, max_drawdown for that window.
+   - Also compute `net_roi`: the same backtest, but with a flat $1 brokerage commission deducted at every ACTUAL trade (nonzero position; a flat/no-trade day is not charged), against an assumed $10,000 starting capital (`STARTING_CAPITAL_USD = 10_000`, `COMMISSION_PER_TRADE_USD = 1.0`). Separate compounding pass over the same decision points as gross `roi`: `capital = capital * (1 + trade_return) - (COMMISSION_PER_TRADE_USD if position != 0 else 0)`, then `net_roi = capital / STARTING_CAPITAL_USD - 1`.
+   - Also compute `num_trades`: count of days where an actual (nonzero) position was taken.
+   - Support an optional `long_only` behavior: module-level `LONG_ONLY = False` (default), set to `True` and applied via `max(position, 0)` clipping only when explicitly instructed.
+   - NO OVERLAP HANDLING NEEDED: because the holding period is exactly one row (open to close, same day), every row is an independent, non-overlapping decision point. Do not stride or space out decision points — evaluate every row in the predict slice directly, unlike swing (which spaces by holding_days) or intraday-minute (which uses wfo.timeutils). Do not import wfo.timeutils here; it isn't needed for this style.
+   - COST-AWARE DESIGN: a round trip costs $2 against the $10,000 capital assumption. A daily open-to-close strategy can trade up to ~21 times/month if it takes a position every single day — that's fine cost-wise, but still prefer a model that's selective (skips low-conviction days) over one that blindly trades every day regardless of signal strength.
+   - Also compute `buy_hold_roi` for that window: plain buy-and-hold return over the SAME predict period using raw (unfiltered) close prices.
+   - Save the fitted model's weights to `<output-dir>/window_<index>_weights.pkl` (pickle)
+   - Save a backtest ledger (per-row: datetime, open, close, future_return, predicted, strategy_return, equity) to `<output-dir>/window_<index>_ledger.csv`
+   - Skip windows with too little data rather than erroring (e.g. ~100+ train rows, ~10-15+ predict rows — daily bars mean far fewer rows than intraday-minute data).
+5. Uses `wfo.schema.WindowResult`, `wfo.schema.IterationResults`, and `wfo.schema.write_results` (already importable) to assemble and write `<output-dir>/results.json` — do not redefine this schema yourself.
+6. Sets `prediction_target` in IterationResults to a short string describing exactly what you're predicting (e.g. "close_above_open_same_day", "close_above_open_by_50bps"). You choose the exact threshold/framing based on the instructions you're given.
+6b. Sets `approach` in IterationResults to a single sentence naming your model type and feature set.
+7. Must run standalone via `python script.py <args>` with `wfo` importable from PYTHONPATH.
+8. Must not make any network calls, must not use subprocess/os.system/eval/exec, and must not read or write any path outside --data-dir (read-only) and --output-dir (write). A separate safety reviewer checks for this before the script is ever run — any violation gets it rejected outright.
+
+Here is a working reference implementation of this exact contract (a deliberately simple baseline). Follow its structure faithfully — the shift(1)-based feature discipline, per-slice computation, no-overlap backtest, output file layout — but come up with your OWN feature engineering, model choice, and prediction threshold per the instructions you are given. Do not just copy this one.
+
+```python
+{reference_source}
+```
+
+Respond with ONLY the complete Python script, in a single fenced python code block. No explanation before or after.
+"""
+
+
+CONTRACT_TEMPLATE_OVERNIGHT = """You are an ML engineering agent for an OVERNIGHT equity signal-prediction system. You do not predict the market yourself — you write the Python code for a traditional ML model (feature engineering, model choice, hyperparameters) that a deterministic harness will train and walk-forward test. A trained model does the actual predicting; your job is the code.
+
+The strategy decides ONCE PER DAY, AT THAT DAY's CLOSE, whether to enter a position — and the position is held OVERNIGHT and ALWAYS closed at the NEXT trading day's OPEN. This is the mirror image of a day-trade (open-to-close) model, and is grounded in a real, documented market anomaly: a large share of long-run U.S. equity returns has historically accrued overnight (close-to-open), not during the trading session.
+
+Write a single self-contained Python script that:
+
+1. Accepts these CLI arguments: --data-dir --ticker --train-months --predict-months --gap-days --output-dir --holdout-months (default 0, int)
+2. Loads OHLCV DAILY-bar data for the given ticker from a CSV at <data-dir>/<ticker>.csv with columns: timestamp (epoch ms, midnight of the trading day), open, high, low, close, volume, vwap, transactions — one row per trading day.
+3. Computes `end = full_data_max_date - 30*holdout_months days` (via `datetime.timedelta`) and uses `wfo.windows.walk_forward_windows(start, end, train_months, predict_months, gap_days)` to generate walk-forward windows — already importable, do not reimplement. `--holdout-months` exists so a trailing slice of history can be reserved during search, then revealed later via `--holdout-months 0` as a genuine blind test.
+4. For EACH window, independently:
+   - Slice the raw dataframe to strictly [train_start, train_end) and [predict_start, predict_end) using the datetime column
+   - IMPORTANT — different from a day-trade (open-to-close) model: because the decision happens AFTER today's close, today's own full OHLCV bar (open, high, low, close, volume, vwap) IS legitimately known at decision time. You do NOT need to `.shift(1)` your features here — compute rolling/lookback indicators normally on the close/high/low/volume columns, ending at (and including) today's own row.
+   - The only forward-looking piece is the LABEL: tomorrow's open vs today's close, i.e. `future_return = open.shift(-1) / close - 1`, `label = future_return > threshold`. This is fine as a training TARGET — it is never used as a feature. Row(s) at the tail of each slice that lack a "tomorrow" will get NaN here and must be dropped via dropna, same as any other forward-looking label.
+   - Compute ALL features and the label freshly on each slice AFTER slicing, never on the full unsliced series — same per-slice discipline as every other style, so nothing crosses the train/predict boundary.
+   - Train a model (any scikit-learn-compatible estimator) on the train slice
+   - Predict/backtest on the predict slice
+   - Compute f1, accuracy, roi, max_drawdown for that window.
+   - Also compute `net_roi`: the same backtest, but with a flat $1 brokerage commission deducted at every ACTUAL trade (nonzero position; a flat/no-trade night is not charged), against an assumed $10,000 starting capital (`STARTING_CAPITAL_USD = 10_000`, `COMMISSION_PER_TRADE_USD = 1.0`). Separate compounding pass over the same decision points as gross `roi`: `capital = capital * (1 + trade_return) - (COMMISSION_PER_TRADE_USD if position != 0 else 0)`, then `net_roi = capital / STARTING_CAPITAL_USD - 1`.
+   - Also compute `num_trades`: count of nights where an actual (nonzero) position was taken.
+   - Support an optional `long_only` behavior: module-level `LONG_ONLY = False` (default), set to `True` and applied via `max(position, 0)` clipping only when explicitly instructed.
+   - NO OVERLAP HANDLING NEEDED: each overnight trade (close[T] to open[T+1]) is independent of the next, so every row is a valid, non-overlapping decision point — no striding/spacing logic needed, and no `wfo.timeutils` import (not applicable to daily bars).
+   - COST-AWARE DESIGN: a round trip costs $2 against the $10,000 capital assumption. This can trade up to ~21 times/month if it takes a position every single night — fine cost-wise, but still prefer a model that's selective (skips low-conviction nights) over one that blindly trades every night.
+   - Also compute `buy_hold_roi` for that window: plain buy-and-hold return over the SAME predict period using raw (unfiltered) close prices.
+   - Save the fitted model's weights to `<output-dir>/window_<index>_weights.pkl` (pickle)
+   - Save a backtest ledger (per-row: datetime, close, future_return, predicted, strategy_return, equity) to `<output-dir>/window_<index>_ledger.csv`
+   - Skip windows with too little data rather than erroring (e.g. ~100+ train rows, ~10-15+ predict rows — daily bars mean far fewer rows than intraday-minute data).
+5. Uses `wfo.schema.WindowResult`, `wfo.schema.IterationResults`, and `wfo.schema.write_results` (already importable) to assemble and write `<output-dir>/results.json` — do not redefine this schema yourself.
+6. Sets `prediction_target` in IterationResults to a short string describing exactly what you're predicting (e.g. "next_open_above_today_close_overnight"). You choose the exact threshold/framing based on the instructions you're given.
+6b. Sets `approach` in IterationResults to a single sentence naming your model type and feature set.
+7. Must run standalone via `python script.py <args>` with `wfo` importable from PYTHONPATH.
+8. Must not make any network calls, must not use subprocess/os.system/eval/exec, and must not read or write any path outside --data-dir (read-only) and --output-dir (write). A separate safety reviewer checks for this before the script is ever run — any violation gets it rejected outright.
+
+Here is a working reference implementation of this exact contract (a deliberately simple baseline). Follow its structure faithfully — no-shift same-day features, per-slice computation, no-overlap backtest, output file layout — but come up with your OWN feature engineering, model choice, and prediction threshold per the instructions you are given. Do not just copy this one.
+
+```python
+{reference_source}
+```
+
+Respond with ONLY the complete Python script, in a single fenced python code block. No explanation before or after.
+"""
+
+
+def _build_system_prompt(style: str = "intraday") -> str:
+    if style == "swing":
+        reference_source = REFERENCE_SWING_MODEL_PATH.read_text()
+        return CONTRACT_TEMPLATE_SWING.format(reference_source=reference_source)
+    if style == "daytrade":
+        reference_source = REFERENCE_DAYTRADE_MODEL_PATH.read_text()
+        return CONTRACT_TEMPLATE_DAYTRADE.format(reference_source=reference_source)
+    if style == "overnight":
+        reference_source = REFERENCE_OVERNIGHT_MODEL_PATH.read_text()
+        return CONTRACT_TEMPLATE_OVERNIGHT.format(reference_source=reference_source)
     reference_source = REFERENCE_MODEL_PATH.read_text()
     return CONTRACT_TEMPLATE.format(reference_source=reference_source)
 
@@ -63,7 +202,12 @@ def _extract_code(text: str) -> str:
     return match.group(1) if match else text
 
 
-def generate_model_script(instructions: str, iteration_tag: str | None = None, model: str = DEFAULT_MODEL) -> Path:
+def generate_model_script(
+    instructions: str,
+    iteration_tag: str | None = None,
+    model: str = DEFAULT_MODEL,
+    style: str = "intraday",
+) -> Path:
     tag = iteration_tag or datetime.now().strftime("%Y%m%dT%H%M%S")
 
     result = subprocess.run(
@@ -72,7 +216,7 @@ def generate_model_script(instructions: str, iteration_tag: str | None = None, m
             "-p",
             instructions,
             "--system-prompt",
-            _build_system_prompt(),
+            _build_system_prompt(style),
             "--model",
             model,
             "--output-format",
@@ -105,9 +249,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("instructions")
     parser.add_argument("--tag", default=None)
+    parser.add_argument("--style", choices=["intraday", "swing", "daytrade", "overnight"], default="intraday")
     args = parser.parse_args()
 
-    path = generate_model_script(args.instructions, args.tag)
+    path = generate_model_script(args.instructions, args.tag, style=args.style)
     print(path)
 
 

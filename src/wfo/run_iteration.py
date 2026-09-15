@@ -10,6 +10,8 @@ from wfo.schema import load_results
 
 ITERATIONS_DIR = Path("iterations")
 DATA_DIR = Path("data/minute_aggs")
+DAILY_DATA_DIR = Path("data/daily_aggs")
+NEWS_DIR = Path("data/news")
 SRC_DIR = Path(__file__).resolve().parents[1]
 SUBPROCESS_TIMEOUT_SECONDS = 3600
 
@@ -27,6 +29,8 @@ def run_iteration(
     iteration_id: str | None = None,
     contract_version: str | None = None,
     holdout_months: int = 0,
+    data_dir: Path = DATA_DIR,
+    news_dir: Path | None = None,
 ) -> tuple[bool, str]:
     iteration_id = iteration_id or make_iteration_id(ticker)
     output_dir = ITERATIONS_DIR / iteration_id
@@ -39,7 +43,7 @@ def run_iteration(
         sys.executable,
         str(script_path),
         "--data-dir",
-        str(DATA_DIR),
+        str(data_dir),
         "--ticker",
         ticker,
         "--train-months",
@@ -53,6 +57,8 @@ def run_iteration(
         "--holdout-months",
         str(holdout_months),
     ]
+    if news_dir is not None:
+        cmd += ["--news-dir", str(news_dir)]
 
     env = {**os.environ, "PYTHONPATH": str(SRC_DIR)}
 
@@ -81,6 +87,9 @@ def run_iteration(
     except ValueError as e:
         return False, f"{iteration_id}: invalid results.json ({e})"
 
+    if not results.windows:
+        return False, f"{iteration_id}: script produced 0 usable windows (too-tight lookback/thresholds for this ticker's data coverage?)"
+
     for w in results.windows:
         if not Path(w.weights_path).exists():
             return False, f"{iteration_id}: window {w.index} weights_path missing: {w.weights_path}"
@@ -98,11 +107,12 @@ def main():
     parser.add_argument("--predict-months", type=int, required=True)
     parser.add_argument("--gap-days", type=int, default=1)
     parser.add_argument("--holdout-months", type=int, default=0)
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     args = parser.parse_args()
 
     ok, message = run_iteration(
         args.script_path, args.ticker, args.train_months, args.predict_months, args.gap_days,
-        holdout_months=args.holdout_months,
+        holdout_months=args.holdout_months, data_dir=args.data_dir,
     )
     print(message)
     sys.exit(0 if ok else 1)
